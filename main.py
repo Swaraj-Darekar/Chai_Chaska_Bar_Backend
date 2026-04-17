@@ -472,7 +472,8 @@ def complete_order(order_id: int, data: CompleteOrder, db = Depends(database.get
             "payment_mode": data.payment_mode,
             "discount": data.discount,
             "final_amount": data.final_amount,
-            "completed_at": completed_at
+            "completed_at": completed_at,
+            "settled": 0
         }
         res = db.table("orders").update(update_data).eq("id", order_id).execute()
         if not res.data:
@@ -507,6 +508,7 @@ def complete_order(order_id: int, data: CompleteOrder, db = Depends(database.get
         db_order.discount = data.discount
         db_order.final_amount = data.final_amount
         db_order.completed_at = completed_at
+        db_order.settled = 0
         
         if should_deduct:
             db_wallet.balance -= commission_amount
