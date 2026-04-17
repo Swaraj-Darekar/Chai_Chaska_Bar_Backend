@@ -47,6 +47,7 @@ class OrderCreate(BaseModel):
     customer_phone: str
     table_id: str
     total_price: float
+    status: Optional[str] = "pending"
     items: List[OrderItemBase]
 
 class AddItems(BaseModel):
@@ -244,42 +245,18 @@ def delete_menu_item(item_id: int, db = Depends(database.get_db)):
 def create_order(order: OrderCreate, db = Depends(database.get_db)):
     if database.USE_SUPABASE:
         # 1. Check if there is an existing active order for this table
-        # active = (status IN ['pending', 'preparing', 'served'] AND settled == 0)
-        existing_res = db.table("orders").select("*, order_items(*)").eq("table_id", order.table_id).in_("status", ["pending", "preparing", "served"]).eq("settled", 0).order("created_at", desc=True).limit(1).execute()
-        
-        if existing_res.data:
-            # If it's a physical table, block merging as per user request
-            if order.table_id != "Takeaway":
+        # Only for physical tables (1-6). Takeaway orders are ALWAYS separate.
+        if order.table_id != "Takeaway":
+            existing_res = db.table("orders").select("*, order_items(*)").eq("table_id", order.table_id).in_("status", ["pending", "preparing", "served"]).eq("settled", 0).order("created_at", desc=True).limit(1).execute()
+            
+            if existing_res.data:
+                # If it's a physical table, block merging as per user request
                 raise HTTPException(status_code=400, detail="Table is already occupied. Please contact counter.")
-            
-            # For Takeaway, we can still merge or handle differently.
-            # But the user said "if table is already exist then even scann the scanner they cant place order".
-            # For now, let's block for physical tables and allow merging for Takeaway if needed.
-            # Actually, to be safe and consistent with the request, let's block all if table_id is not Takeaway.
-            
-            existing_order = existing_res.data[0]
-            existing_id = existing_order["id"]
-            new_total = existing_order["total_price"] + order.total_price
-            
-            # ... (merging logic for takeaway if we want to keep it)
-            # Actually, let's just keep the merging for takeaway for now.
-            db.table("orders").update({"total_price": new_total}).eq("id", existing_id).execute()
-            for item in order.items:
-                match = next((oi for oi in existing_order["order_items"] if oi["item_name"] == item.item_name and oi["item_price"] == item.item_price), None)
-                if match:
-                    db.table("order_items").update({"quantity": match["quantity"] + item.quantity}).eq("id", match["id"]).execute()
-                else:
-                    new_item_data = item.model_dump()
-                    new_item_data["order_id"] = existing_id
-                    db.table("order_items").insert([new_item_data]).execute()
-            
-            final_res = db.table("orders").select("*, order_items(*)").eq("id", existing_id).execute()
-            return final_res.data[0]
 
         # No active order found, proceed with new order creation
-        order_data = order.model_dump()
-        items_data = order_data.pop("items")
-        order_res = db.table("orders").insert([order_data]).execute()
+        order_dict = order.model_dump()
+        items_data = order_dict.pop("items")
+        order_res = db.table("orders").insert([order_dict]).execute()
         new_order = order_res.data[0]
         
         if items_data:
@@ -293,39 +270,24 @@ def create_order(order: OrderCreate, db = Depends(database.get_db)):
         return new_order
     else:
         # 1. Check if there is an existing active order for SQLite
-        db_order = db.query(database.OrderModel).filter(
-            database.OrderModel.table_id == order.table_id,
-            database.OrderModel.status.in_(["pending", "preparing", "served"]),
-            database.OrderModel.settled == 0
-        ).order_by(database.OrderModel.id.desc()).first()
+        # Only for physical tables. Takeaway orders are ALWAYS separate.
+        if order.table_id != "Takeaway":
+            db_order = db.query(database.OrderModel).filter(
+                database.OrderModel.table_id == order.table_id,
+                database.OrderModel.status.in_(["pending", "preparing", "served"]),
+                database.OrderModel.settled == 0
+            ).order_by(database.OrderModel.id.desc()).first()
 
-        if db_order:
-            if order.table_id != "Takeaway":
+            if db_order:
                 raise HTTPException(status_code=400, detail="Table is already occupied. Please contact counter.")
-
-            db_order.total_price += order.total_price
-            for item in order.items:
-                existing_item = db.query(database.OrderItemModel).filter(
-                    database.OrderItemModel.order_id == db_order.id,
-                    database.OrderItemModel.item_name == item.item_name,
-                    database.OrderItemModel.item_price == item.item_price
-                ).first()
-                if existing_item:
-                    existing_item.quantity += item.quantity
-                else:
-                    new_item = database.OrderItemModel(order_id=db_order.id, item_name=item.item_name, item_price=item.item_price, quantity=item.quantity)
-                    db.add(new_item)
-            db.commit()
-            db.refresh(db_order)
-            items = db.query(database.OrderItemModel).filter(database.OrderItemModel.order_id == db_order.id).all()
-            return {**db_order.__dict__, "items": items}
 
         # 2. No active order, create new
         db_order = database.OrderModel(
             customer_name=order.customer_name,
             customer_phone=order.customer_phone,
             table_id=order.table_id,
-            total_price=order.total_price
+            total_price=order.total_price,
+            status=order.status
         )
         db.add(db_order)
         db.commit()
