@@ -452,8 +452,8 @@ def update_order_status(order_id: int, status: str, db = Depends(database.get_db
 
 @app.put("/api/orders/{order_id}/complete")
 def complete_order(order_id: int, data: CompleteOrder, db = Depends(database.get_db)):
-    from datetime import datetime
-    completed_at = datetime.now().isoformat()
+    from datetime import datetime, timezone
+    completed_at = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
     
     # Wallet Logic
     should_deduct = data.final_amount > 40
