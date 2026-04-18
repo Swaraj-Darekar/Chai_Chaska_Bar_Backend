@@ -515,8 +515,64 @@ def delete_order_item(order_id: int, item_pk: int, db = Depends(database.get_db)
         order.total_price = new_total
         db.commit()
         return {"msg": "Item deleted", "new_total": new_total}
+@app.delete("/api/orders/{order_id}")
+def delete_order(order_id: int, db = Depends(database.get_db)):
+    if database.USE_SUPABASE:
+        # 1. Delete associated items first
+        db.table("order_items").delete().eq("order_id", order_id).execute()
+        # 2. Delete the order
+        res = db.table("orders").delete().eq("id", order_id).execute()
+        if not res.data:
+            raise HTTPException(status_code=404, detail="Order not found")
+        return {"msg": "Order deleted successfully"}
+    else:
+        # SQLite
+        # 1. Delete items
+        db.query(database.OrderItemModel).filter(database.OrderItemModel.order_id == order_id).delete()
+        # 2. Delete order
+        db_order = db.query(database.OrderModel).filter(database.OrderModel.id == order_id).first()
+        if not db_order:
+            raise HTTPException(status_code=404, detail="Order not found")
+        db.delete(db_order)
+        db.commit()
+        return {"msg": "Order deleted successfully"}
+
+@app.put("/api/orders/{order_id}/move")
+def move_order(order_id: int, new_table_id: str, db = Depends(database.get_db)):
+    if database.USE_SUPABASE:
+        # 1. Check if new table is already occupied
+        existing = db.table("orders").select("id").eq("table_id", new_table_id).in_("status", ["pending", "preparing", "served"]).eq("settled", 0).execute()
+        if existing.data:
+            raise HTTPException(status_code=400, detail=f"Table {new_table_id} is already occupied")
+        
+        # 2. Update the order
+        res = db.table("orders").update({"table_id": new_table_id}).eq("id", order_id).execute()
+        if not res.data:
+            raise HTTPException(status_code=404, detail="Order not found")
+        return res.data[0]
+    else:
+        # SQLite
+        # 1. Check occupancy
+        existing = db.query(database.OrderModel).filter(
+            database.OrderModel.table_id == new_table_id,
+            database.OrderModel.status.in_(["pending", "preparing", "served"]),
+            database.OrderModel.settled == 0
+        ).first()
+        if existing:
+            raise HTTPException(status_code=400, detail=f"Table {new_table_id} is already occupied")
+        
+        db_order = db.query(database.OrderModel).filter(database.OrderModel.id == order_id).first()
+        if not db_order:
+            raise HTTPException(status_code=404, detail="Order not found")
+            
+        db_order.table_id = new_table_id
+        db.commit()
+        db.refresh(db_order)
+        return db_order
 
 @app.get("/api/wallet")
+
+
 def get_wallet(db = Depends(database.get_db)):
     if database.USE_SUPABASE:
         res = db.table("cafe_wallet").select("balance").eq("id", 1).execute()
