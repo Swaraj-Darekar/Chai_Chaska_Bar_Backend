@@ -42,13 +42,33 @@ class OrderModel(Base):
     table_id = Column(String, nullable=False)
     total_price = Column(Float, nullable=False)
     status = Column(String, default="pending")  # pending | preparing | served | done
-    payment_mode = Column(String, nullable=True)  # cash | online
+    payment_mode = Column(String, nullable=True)  # cash | online | Cash, PhonePe, etc.
+    payment_status = Column(String, default="due")  # paid | due
+    member_id = Column(Integer, ForeignKey("members.id"), nullable=True)
     discount = Column(Float, default=0)
     final_amount = Column(Float, nullable=True)
     settled = Column(Integer, default=0) # 0: No, 1: Yes (Using Integer for better cross-compat)
     settlement_id = Column(Integer, ForeignKey("monthly_settlements.id"), nullable=True)
     created_at = Column(String, default=lambda: datetime.now().isoformat())
     completed_at = Column(String, nullable=True)
+
+class MemberModel(Base):
+    __tablename__ = "members"
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    name = Column(String, nullable=False)
+    phone = Column(String, nullable=True)
+    total_bill = Column(Float, default=0.0)
+    due_bill = Column(Float, default=0.0)
+    created_at = Column(String, default=lambda: datetime.now().isoformat())
+
+class MemberPaymentModel(Base):
+    __tablename__ = "member_payments"
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    member_id = Column(Integer, ForeignKey("members.id"), nullable=False)
+    amount = Column(Float, nullable=False)
+    payment_mode = Column(String, nullable=False)  # Cash, PhonePe, GPay, Paytm, etc.
+    note = Column(String, nullable=True)
+    created_at = Column(String, default=lambda: datetime.now().isoformat())
 
 class OrderItemModel(Base):
     __tablename__ = "order_items"

@@ -37,6 +37,43 @@ class ItemBase(BaseModel):
 class ItemResponse(ItemBase):
     id: int
 
+class MemberBase(BaseModel):
+    name: str
+    phone: Optional[str] = None
+
+class MemberCreate(MemberBase):
+    pass
+
+class MemberUpdate(BaseModel):
+    name: Optional[str] = None
+    phone: Optional[str] = None
+
+class MemberResponse(MemberBase):
+    id: int
+    total_bill: float = 0.0
+    due_bill: float = 0.0
+    platform_fee: float = 0.0
+    days_overdue: int = 0
+    total_due_bill: float = 0.0
+    last_payment_amount: Optional[float] = 0.0
+    last_bill_amount: Optional[float] = 0.0
+    created_at: str
+
+class MemberPaymentCreate(BaseModel):
+    amount: float
+    payment_mode: str
+    note: Optional[str] = None
+    bill_amount: Optional[float] = None  # total due at time of payment
+    commission_amount: Optional[float] = None  # late fee / platform commission collected
+
+class MemberPaymentResponse(BaseModel):
+    id: int
+    member_id: int
+    amount: float
+    payment_mode: str
+    note: Optional[str] = None
+    created_at: str
+
 class OrderItemBase(BaseModel):
     item_name: str
     item_price: float
@@ -48,15 +85,29 @@ class OrderCreate(BaseModel):
     table_id: str
     total_price: float
     status: Optional[str] = "pending"
+    payment_status: Optional[str] = "due"
+    member_id: Optional[int] = None
     items: List[OrderItemBase]
 
 class AddItems(BaseModel):
     items: List[OrderItemBase]
 
 class CompleteOrder(BaseModel):
-    payment_mode: str  # cash | online
+    payment_mode: Optional[str] = "cash"  # cash | online | PhonePe | Due Credit
+    payment_status: Optional[str] = "paid"  # paid | due
     discount: float = 0
+    extra_money: float = 0
     final_amount: float
+
+class MemberQuickOrderItem(BaseModel):
+    id: int
+    name: str
+    price: float
+    qty: int
+
+class MemberQuickOrderCreate(BaseModel):
+    items: List[MemberQuickOrderItem]
+    payment_status: str  # paid | due
 
 class WalletRecharge(BaseModel):
     amount: float
@@ -74,7 +125,7 @@ def get_system_settings(db) -> float:
         setting = db.query(database.SystemSettingsModel).filter(database.SystemSettingsModel.key == "commission_rate").first()
         if setting:
             return setting.value
-    return 2.0
+    return 3.0
 
 def set_system_settings(db, rate: float):
     if database.USE_SUPABASE:
@@ -99,6 +150,8 @@ class OrderResponse(BaseModel):
     total_price: float
     status: str
     payment_mode: Optional[str] = None
+    payment_status: Optional[str] = "due"
+    member_id: Optional[int] = None
     discount: float = 0
     final_amount: Optional[float] = None
     settled: int = 0
@@ -130,14 +183,41 @@ class MonthlySettlementResponse(BaseModel):
 def read_root():
     return {"message": "Welcome to Chai Chaska Bar API", "using_supabase": database.USE_SUPABASE}
 
+def sort_category_priority(cat_name: str) -> int:
+    n = (cat_name or '').lower()
+    if 'chai' in n or ('tea' in n and 'ice' not in n):
+        return 1
+    if 'ciga' in n or 'cigr' in n or 'cigarette' in n or 'smoke' in n or 'tobacco' in n:
+        return 2
+    if 'hot' in n and ('coff' in n or 'cofe' in n or 'coffee' in n):
+        return 3
+    if 'cold' in n and ('coff' in n or 'cofe' in n or 'coffee' in n):
+        return 4
+    if 'ice' in n and ('tea' in n or 'lemon' in n):
+        return 5
+    if 'mocktail' in n or 'shake' in n or 'cooler' in n or 'cold drink' in n:
+        return 6
+    if 'water' in n or 'bottle' in n:
+        return 7
+    return 99
+
 # Categories
 @app.get("/api/categories", response_model=List[CategoryResponse])
 def get_categories(db = Depends(database.get_db)):
     if database.USE_SUPABASE:
         res = db.table("categories").select("*").execute()
-        return res.data
+        cats = res.data or []
     else:
-        return db.query(database.CategoryModel).all()
+        db_cats = db.query(database.CategoryModel).all()
+        cats = [
+            {
+                "id": c.id,
+                "name": c.name,
+                "created_at": str(c.created_at)
+            }
+            for c in db_cats
+        ]
+    return sorted(cats, key=lambda c: (sort_category_priority(c.get("name", "")), (c.get("name") or "").lower()))
 
 @app.post("/api/categories", response_model=CategoryResponse)
 def create_category(category: CategoryBase, db = Depends(database.get_db)):
@@ -418,10 +498,25 @@ def complete_order(order_id: int, data: CompleteOrder, db = Depends(database.get
     completed_at = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
     
     # Wallet Logic
-    should_deduct = data.final_amount > 40
+    should_deduct = True
     commission_amount = get_system_settings(db)
     
+    pay_status = (data.payment_status or "paid").strip().lower()
+    pay_mode = data.payment_mode or ("Due Credit" if pay_status == 'due' else "Cash")
+    
     if database.USE_SUPABASE:
+        # Fetch existing order to check member linkage
+        ord_res = db.table("orders").select("member_id, customer_phone").eq("id", order_id).execute()
+        existing_ord = ord_res.data[0] if ord_res.data else {}
+        check_m_id = existing_ord.get("member_id")
+        if not check_m_id and existing_ord.get("customer_phone") and existing_ord.get("customer_phone") != "—":
+            mem_check = db.table("members").select("id").eq("phone", existing_ord["customer_phone"]).execute()
+            if mem_check.data:
+                check_m_id = mem_check.data[0]["id"]
+
+        if pay_status == 'due' and not check_m_id:
+            raise HTTPException(status_code=400, detail="Due billing is only allowed for registered members. Please select a member when starting the table.")
+
         # Check wallet
         wallet_res = db.table("cafe_wallet").select("balance").eq("id", 1).execute()
         wallet_balance = wallet_res.data[0]["balance"] if wallet_res.data else 0
@@ -431,7 +526,8 @@ def complete_order(order_id: int, data: CompleteOrder, db = Depends(database.get
             
         update_data = {
             "status": "done",
-            "payment_mode": data.payment_mode,
+            "payment_mode": pay_mode,
+            "payment_status": pay_status,
             "discount": data.discount,
             "final_amount": data.final_amount,
             "completed_at": completed_at,
@@ -440,6 +536,19 @@ def complete_order(order_id: int, data: CompleteOrder, db = Depends(database.get
         res = db.table("orders").update(update_data).eq("id", order_id).execute()
         if not res.data:
             raise HTTPException(status_code=404, detail="Order not found")
+        
+        completed_order = res.data[0]
+        
+        # Update Member balances if linked
+        member_id = completed_order.get("member_id") or check_m_id
+        if member_id:
+            mem_res = db.table("members").select("total_bill, due_bill").eq("id", member_id).execute()
+            if mem_res.data:
+                current_mem = mem_res.data[0]
+                new_total = float(current_mem.get("total_bill") or 0) + float(data.final_amount)
+                added_due = float(data.final_amount) if pay_status == 'due' else 0.0
+                new_due = float(current_mem.get("due_bill") or 0) + added_due
+                db.table("members").update({"total_bill": new_total, "due_bill": new_due}).eq("id", member_id).execute()
             
         if should_deduct:
             new_balance = wallet_balance - commission_amount
@@ -449,8 +558,22 @@ def complete_order(order_id: int, data: CompleteOrder, db = Depends(database.get
                 "description": f"Commission for Order #{order_id}"
             }]).execute()
             
-        return res.data[0]
+        return completed_order
     else:
+        db_order = db.query(database.OrderModel).filter(database.OrderModel.id == order_id).first()
+        if not db_order:
+            raise HTTPException(status_code=404, detail="Order not found")
+
+        # Check member linkage
+        target_member = None
+        if db_order.member_id:
+            target_member = db.query(database.MemberModel).filter(database.MemberModel.id == db_order.member_id).first()
+        elif db_order.customer_phone and db_order.customer_phone != "—":
+            target_member = db.query(database.MemberModel).filter(database.MemberModel.phone == db_order.customer_phone).first()
+
+        if pay_status == 'due' and not target_member:
+            raise HTTPException(status_code=400, detail="Due billing is only allowed for registered members. Please select a member when starting the table.")
+
         # Check wallet
         db_wallet = db.query(database.CafeWalletModel).filter(database.CafeWalletModel.id == 1).first()
         if not db_wallet:
@@ -460,17 +583,26 @@ def complete_order(order_id: int, data: CompleteOrder, db = Depends(database.get
             
         if should_deduct and db_wallet.balance < 10:
             raise HTTPException(status_code=400, detail="Insufficient wallet balance. Please recharge.")
-
-        db_order = db.query(database.OrderModel).filter(database.OrderModel.id == order_id).first()
-        if not db_order:
-            raise HTTPException(status_code=404, detail="Order not found")
             
         db_order.status = "done"
-        db_order.payment_mode = data.payment_mode
+        db_order.payment_mode = pay_mode
+        db_order.payment_status = pay_status
         db_order.discount = data.discount
         db_order.final_amount = data.final_amount
         db_order.completed_at = completed_at
         db_order.settled = 0
+        
+        # Update Member balances if linked
+        target_member = None
+        if db_order.member_id:
+            target_member = db.query(database.MemberModel).filter(database.MemberModel.id == db_order.member_id).first()
+        elif db_order.customer_phone:
+            target_member = db.query(database.MemberModel).filter(database.MemberModel.phone == db_order.customer_phone).first()
+            
+        if target_member:
+            target_member.total_bill = float(target_member.total_bill or 0) + float(data.final_amount)
+            if pay_status == 'due':
+                target_member.due_bill = float(target_member.due_bill or 0) + float(data.final_amount)
         
         if should_deduct:
             db_wallet.balance -= commission_amount
@@ -482,6 +614,441 @@ def complete_order(order_id: int, data: CompleteOrder, db = Depends(database.get
             
         db.commit()
         db.refresh(db_order)
+        return db_order
+
+def calculate_platform_fee_for_member(member_id: int, base_due: float, db):
+    if base_due <= 0:
+        return 0.0, 0, 0.0
+    FEE_PER_DAY = 5.0
+    from datetime import datetime, timezone
+
+    if database.USE_SUPABASE:
+        pmt_res = db.table("member_payments").select("created_at").eq("member_id", member_id).order("created_at", desc=True).limit(1).execute()
+        last_payment_date_str = pmt_res.data[0]["created_at"] if pmt_res.data else None
+
+        orders_q = db.table("orders").select("completed_at, created_at").eq("member_id", member_id).eq("payment_status", "due").eq("status", "done")
+        if last_payment_date_str:
+            orders_q = orders_q.gte("completed_at", last_payment_date_str)
+        orders_res = orders_q.order("completed_at", desc=False).limit(1).execute()
+
+        oldest_date_str = None
+        if orders_res.data:
+            oldest_date_str = orders_res.data[0].get("completed_at") or orders_res.data[0].get("created_at")
+
+        if not oldest_date_str:
+            return 0.0, 0, base_due
+
+        try:
+            oldest_date = datetime.fromisoformat(oldest_date_str.replace('Z', '+00:00')).date()
+        except Exception:
+            return 0.0, 0, base_due
+
+        today = datetime.now(timezone.utc).date()
+        days_overdue = max(0, (today - oldest_date).days)
+        platform_fee = round(days_overdue * FEE_PER_DAY, 2)
+        return platform_fee, days_overdue, round(base_due + platform_fee, 2)
+    else:
+        last_pmt = db.query(database.MemberPaymentModel).filter(
+            database.MemberPaymentModel.member_id == member_id
+        ).order_by(database.MemberPaymentModel.created_at.desc()).first()
+
+        orders_q = db.query(database.OrderModel).filter(
+            database.OrderModel.member_id == member_id,
+            database.OrderModel.payment_status == "due",
+            database.OrderModel.status == "done"
+        )
+        if last_pmt:
+            orders_q = orders_q.filter(database.OrderModel.completed_at >= last_pmt.created_at)
+
+        oldest_order = orders_q.order_by(database.OrderModel.completed_at.asc()).first()
+        if not oldest_order:
+            return 0.0, 0, base_due
+
+        oldest_date_str = oldest_order.completed_at or oldest_order.created_at
+        try:
+            oldest_date = datetime.fromisoformat(oldest_date_str.replace('Z', '+00:00')).date()
+        except Exception:
+            return 0.0, 0, base_due
+
+        today = datetime.now(timezone.utc).date()
+        days_overdue = max(0, (today - oldest_date).days)
+        platform_fee = round(days_overdue * FEE_PER_DAY, 2)
+        return platform_fee, days_overdue, round(base_due + platform_fee, 2)
+
+# ===== MEMBERS API =====
+@app.get("/api/members", response_model=List[MemberResponse])
+def get_members(db = Depends(database.get_db)):
+    if database.USE_SUPABASE:
+        res = db.table("members").select("*").order("name", desc=False).execute()
+        members = res.data or []
+        result = []
+        for m in members:
+            m_dict = dict(m)
+            p_fee, days, total_due = calculate_platform_fee_for_member(m_dict["id"], float(m_dict.get("due_bill") or 0), db)
+            
+            pmt_res = db.table("member_payments").select("amount, bill_amount").eq("member_id", m_dict["id"]).order("created_at", desc=True).limit(1).execute()
+            last_pmt_amt = float(pmt_res.data[0]["amount"] or 0) if pmt_res.data else 0.0
+            last_bill_amt = float(pmt_res.data[0]["bill_amount"] or 0) if (pmt_res.data and pmt_res.data[0].get("bill_amount")) else 0.0
+
+            m_dict["platform_fee"] = p_fee
+            m_dict["days_overdue"] = days
+            m_dict["total_due_bill"] = total_due
+            m_dict["last_payment_amount"] = last_pmt_amt
+            m_dict["last_bill_amount"] = last_bill_amt
+            result.append(m_dict)
+        return result
+    else:
+        db_members = db.query(database.MemberModel).order_by(database.MemberModel.name.asc()).all()
+        result = []
+        for m in db_members:
+            p_fee, days, total_due = calculate_platform_fee_for_member(m.id, float(m.due_bill or 0), db)
+            last_pmt = db.query(database.MemberPaymentModel).filter(
+                database.MemberPaymentModel.member_id == m.id
+            ).order_by(database.MemberPaymentModel.created_at.desc()).first()
+            
+            last_pmt_amt = float(last_pmt.amount or 0) if last_pmt else 0.0
+            last_bill_amt = float(getattr(last_pmt, 'bill_amount', 0) or 0) if last_pmt else 0.0
+
+            m_dict = {
+                "id": m.id,
+                "name": m.name,
+                "phone": m.phone,
+                "total_bill": float(m.total_bill or 0),
+                "due_bill": float(m.due_bill or 0),
+                "platform_fee": p_fee,
+                "days_overdue": days,
+                "total_due_bill": total_due,
+                "last_payment_amount": last_pmt_amt,
+                "last_bill_amount": last_bill_amt,
+                "created_at": str(m.created_at)
+            }
+            result.append(m_dict)
+        return result
+
+@app.post("/api/members", response_model=MemberResponse)
+def create_member(member: MemberCreate, db = Depends(database.get_db)):
+    if database.USE_SUPABASE:
+        res = db.table("members").insert([member.model_dump()]).execute()
+        return res.data[0]
+    else:
+        db_member = database.MemberModel(**member.model_dump())
+        db.add(db_member)
+        db.commit()
+        db.refresh(db_member)
+        return db_member
+
+@app.put("/api/members/{member_id}")
+def update_member(member_id: int, data: MemberUpdate, db = Depends(database.get_db)):
+    update_data = {k: v for k, v in data.model_dump().items() if v is not None}
+    if not update_data:
+        raise HTTPException(status_code=400, detail="No fields to update")
+        
+    if database.USE_SUPABASE:
+        res = db.table("members").update(update_data).eq("id", member_id).execute()
+        if not res.data:
+            raise HTTPException(status_code=404, detail="Member not found")
+        return res.data[0]
+    else:
+        db_member = db.query(database.MemberModel).filter(database.MemberModel.id == member_id).first()
+        if not db_member:
+            raise HTTPException(status_code=404, detail="Member not found")
+        for k, v in update_data.items():
+            setattr(db_member, k, v)
+        db.commit()
+        db.refresh(db_member)
+        return db_member
+
+@app.delete("/api/members/{member_id}")
+def delete_member(member_id: int, db = Depends(database.get_db)):
+    if database.USE_SUPABASE:
+        # Delete member payments
+        db.table("member_payments").delete().eq("member_id", member_id).execute()
+        # Delete member
+        res = db.table("members").delete().eq("id", member_id).execute()
+        return {"success": True, "message": "Member deleted successfully"}
+    else:
+        db_member = db.query(database.MemberModel).filter(database.MemberModel.id == member_id).first()
+        if not db_member:
+            raise HTTPException(status_code=404, detail="Member not found")
+        db.query(database.MemberPaymentModel).filter(database.MemberPaymentModel.member_id == member_id).delete()
+        db.delete(db_member)
+        db.commit()
+        return {"success": True, "message": "Member deleted successfully"}
+
+@app.post("/api/members/{member_id}/reset")
+def reset_member_ledger(member_id: int, db = Depends(database.get_db)):
+    """Reset member ledger to start fresh from 0, recording snapshot note in payment history."""
+    if database.USE_SUPABASE:
+        mem_res = db.table("members").select("*").eq("id", member_id).execute()
+        if not mem_res.data:
+            raise HTTPException(status_code=404, detail="Member not found")
+        member = mem_res.data[0]
+        
+        old_total = float(member.get("total_bill") or 0)
+        old_due = float(member.get("due_bill") or 0)
+        
+        # Log snapshot in member_payments
+        snapshot_note = f"📋 LEDGER RESET / NEW BOOK STARTED — Total Billed: ₹{old_total}, Due Cleared: ₹{old_due}"
+        db.table("member_payments").insert([{
+            "member_id": member_id,
+            "amount": 0.0,
+            "payment_mode": "Ledger Reset",
+            "note": snapshot_note,
+            "bill_amount": old_due
+        }]).execute()
+        
+        # Reset member balances to 0
+        res = db.table("members").update({"total_bill": 0.0, "due_bill": 0.0}).eq("id", member_id).execute()
+        return res.data[0]
+    else:
+        db_member = db.query(database.MemberModel).filter(database.MemberModel.id == member_id).first()
+        if not db_member:
+            raise HTTPException(status_code=404, detail="Member not found")
+            
+        old_total = db_member.total_bill or 0.0
+        old_due = db_member.due_bill or 0.0
+        
+        snapshot_note = f"📋 LEDGER RESET / NEW BOOK STARTED — Total Billed: ₹{old_total}, Due Cleared: ₹{old_due}"
+        db_pmt = database.MemberPaymentModel(
+            member_id=member_id,
+            amount=0.0,
+            payment_mode="Ledger Reset",
+            note=snapshot_note
+        )
+        db.add(db_pmt)
+        db_member.total_bill = 0.0
+        db_member.due_bill = 0.0
+        db.commit()
+        db.refresh(db_member)
+        return db_member
+
+@app.get("/api/members/{member_id}/history")
+def get_member_history(member_id: int, db = Depends(database.get_db)):
+    if database.USE_SUPABASE:
+        mem_res = db.table("members").select("*").eq("id", member_id).execute()
+        if not mem_res.data:
+            raise HTTPException(status_code=404, detail="Member not found")
+        member = mem_res.data[0]
+        
+        orders_res = db.table("orders").select("*, order_items(*)").eq("member_id", member_id).execute()
+        orders = orders_res.data or []
+        if not orders and member.get("phone"):
+            orders_res = db.table("orders").select("*, order_items(*)").eq("customer_phone", member["phone"]).execute()
+            orders = orders_res.data or []
+            
+        pmt_res = db.table("member_payments").select("*").eq("member_id", member_id).execute()
+        payments = pmt_res.data or []
+        
+        history = []
+        for o in orders:
+            history.append({
+                "type": "purchase",
+                "id": f"ord_{o['id']}",
+                "date": o.get("completed_at") or o.get("created_at"),
+                "total": o.get("final_amount") or o.get("total_price") or 0,
+                "payment_status": o.get("payment_status", "due"),
+                "items": [{"name": i["item_name"], "price": i["item_price"] * i["quantity"], "qty": i["quantity"]} for i in o.get("order_items", [])]
+            })
+            
+        for p in payments:
+            paid = float(p.get("amount") or 0)
+            bill = float(p.get("bill_amount") or 0)
+            remaining = round(max(0.0, bill - paid), 2) if bill > 0 else None
+            history.append({
+                "type": "payment",
+                "id": f"pmt_{p['id']}",
+                "date": p.get("created_at"),
+                "amount": paid,
+                "bill_amount": bill if bill > 0 else None,
+                "remaining": remaining,
+                "note": p.get("note") or f"Paid via {p.get('payment_mode')}",
+                "payment_mode": p.get("payment_mode")
+            })
+            
+        history.sort(key=lambda x: str(x.get("date") or ""), reverse=True)
+        return history
+    else:
+        db_member = db.query(database.MemberModel).filter(database.MemberModel.id == member_id).first()
+        if not db_member:
+            raise HTTPException(status_code=404, detail="Member not found")
+            
+        orders = db.query(database.OrderModel).filter(database.OrderModel.member_id == member_id).all()
+        if not orders and db_member.phone:
+            orders = db.query(database.OrderModel).filter(database.OrderModel.customer_phone == db_member.phone).all()
+            
+        payments = db.query(database.MemberPaymentModel).filter(database.MemberPaymentModel.member_id == member_id).all()
+        
+        history = []
+        for o in orders:
+            items = db.query(database.OrderItemModel).filter(database.OrderItemModel.order_id == o.id).all()
+            history.append({
+                "type": "purchase",
+                "id": f"ord_{o.id}",
+                "date": o.completed_at or o.created_at,
+                "total": o.final_amount or o.total_price or 0,
+                "payment_status": o.payment_status or "due",
+                "items": [{"name": i.item_name, "price": i.item_price * i.quantity, "qty": i.quantity} for i in items]
+            })
+            
+        for p in payments:
+            paid = float(p.amount or 0)
+            bill = float(p.bill_amount or 0) if hasattr(p, 'bill_amount') else 0
+            remaining = round(max(0.0, bill - paid), 2) if bill > 0 else None
+            history.append({
+                "type": "payment",
+                "id": f"pmt_{p.id}",
+                "date": p.created_at,
+                "amount": paid,
+                "bill_amount": bill if bill > 0 else None,
+                "remaining": remaining,
+                "note": p.note or f"Paid via {p.payment_mode}",
+                "payment_mode": p.payment_mode
+            })
+            
+        history.sort(key=lambda x: str(x.get("date") or ""), reverse=True)
+        return history
+
+@app.post("/api/members/{member_id}/payments")
+def create_member_payment(member_id: int, pmt: MemberPaymentCreate, db = Depends(database.get_db)):
+    if database.USE_SUPABASE:
+        mem_res = db.table("members").select("*").eq("id", member_id).execute()
+        if not mem_res.data:
+            raise HTTPException(status_code=404, detail="Member not found")
+        member = mem_res.data[0]
+        
+        p_dict = {
+            "member_id": member_id,
+            "amount": pmt.amount,
+            "payment_mode": pmt.payment_mode,
+            "note": pmt.note
+        }
+        res = db.table("member_payments").insert([p_dict]).execute()
+        
+        new_due = max(0.0, float(member.get("due_bill", 0)) - pmt.amount)
+        db.table("members").update({"due_bill": new_due}).eq("id", member_id).execute()
+        
+        # Deduct commission from wallet if collected
+        commission = float(pmt.commission_amount or 0)
+        if commission > 0:
+            wallet_res = db.table("cafe_wallet").select("balance").eq("id", 1).execute()
+            current_bal = wallet_res.data[0]["balance"] if wallet_res.data else 0
+            new_bal = current_bal - commission
+            if wallet_res.data:
+                db.table("cafe_wallet").update({"balance": new_bal}).eq("id", 1).execute()
+            else:
+                db.table("cafe_wallet").insert([{"id": 1, "balance": new_bal}]).execute()
+            db.table("wallet_transactions").insert([{
+                "amount": -commission,
+                "description": f"Late fee commission deducted for member #{member_id} ({member.get('name', '')})"
+            }]).execute()
+        
+        return res.data[0]
+    else:
+        db_member = db.query(database.MemberModel).filter(database.MemberModel.id == member_id).first()
+        if not db_member:
+            raise HTTPException(status_code=404, detail="Member not found")
+            
+        db_pmt = database.MemberPaymentModel(
+            member_id=member_id,
+            amount=pmt.amount,
+            payment_mode=pmt.payment_mode,
+            note=pmt.note
+        )
+        db.add(db_pmt)
+        db_member.due_bill = max(0.0, db_member.due_bill - pmt.amount)
+        
+        # Deduct commission from wallet if collected
+        commission = float(pmt.commission_amount or 0)
+        if commission > 0:
+            db_wallet = db.query(database.CafeWalletModel).filter(database.CafeWalletModel.id == 1).first()
+            if db_wallet:
+                db_wallet.balance -= commission
+            else:
+                db_wallet = database.CafeWalletModel(id=1, balance=-commission)
+                db.add(db_wallet)
+            db_txn = database.WalletTransactionModel(
+                amount=-commission,
+                description=f"Late fee commission deducted for member #{member_id} ({db_member.name})"
+            )
+            db.add(db_txn)
+        
+        db.commit()
+        db.refresh(db_pmt)
+        return db_pmt
+
+@app.post("/api/members/{member_id}/quick-order")
+def create_member_quick_order(member_id: int, data: MemberQuickOrderCreate, db = Depends(database.get_db)):
+    from datetime import datetime, timezone
+    now_str = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+    
+    total = sum(i.price * i.qty for i in data.items)
+    
+    if database.USE_SUPABASE:
+        mem_res = db.table("members").select("*").eq("id", member_id).execute()
+        if not mem_res.data:
+            raise HTTPException(status_code=404, detail="Member not found")
+        member = mem_res.data[0]
+        
+        order_dict = {
+            "customer_name": member["name"],
+            "customer_phone": member.get("phone") or "—",
+            "table_id": "Member",
+            "total_price": total,
+            "final_amount": total,
+            "status": "done",
+            "payment_mode": "Cash" if data.payment_status == 'paid' else "Due Credit",
+            "payment_status": data.payment_status,
+            "member_id": member_id,
+            "created_at": now_str,
+            "completed_at": now_str
+        }
+        order_res = db.table("orders").insert([order_dict]).execute()
+        new_order = order_res.data[0]
+        
+        items_data = [{"order_id": new_order["id"], "item_name": i.name, "item_price": i.price, "quantity": i.qty} for i in data.items]
+        db.table("order_items").insert(items_data).execute()
+        
+        new_total_bill = float(member.get("total_bill", 0)) + total
+        new_due_bill = float(member.get("due_bill", 0)) + (total if data.payment_status == 'due' else 0)
+        db.table("members").update({"total_bill": new_total_bill, "due_bill": new_due_bill}).eq("id", member_id).execute()
+        
+        return new_order
+    else:
+        db_member = db.query(database.MemberModel).filter(database.MemberModel.id == member_id).first()
+        if not db_member:
+            raise HTTPException(status_code=404, detail="Member not found")
+            
+        db_order = database.OrderModel(
+            customer_name=db_member.name,
+            customer_phone=db_member.phone or "—",
+            table_id="Member",
+            total_price=total,
+            final_amount=total,
+            status="done",
+            payment_mode="Cash" if data.payment_status == 'paid' else "Due Credit",
+            payment_status=data.payment_status,
+            member_id=member_id,
+            created_at=now_str,
+            completed_at=now_str
+        )
+        db.add(db_order)
+        db.commit()
+        db.refresh(db_order)
+        
+        for i in data.items:
+            db_item = database.OrderItemModel(
+                order_id=db_order.id,
+                item_name=i.name,
+                item_price=i.price,
+                quantity=i.qty
+            )
+            db.add(db_item)
+            
+        db_member.total_bill += total
+        if data.payment_status == 'due':
+            db_member.due_bill += total
+            
+        db.commit()
         return db_order
 
 # Wallet API
@@ -842,6 +1409,120 @@ def get_settlement_expenses(settlement_id: int, db = Depends(database.get_db)):
         return res.data
     else:
         return db.query(database.ExpenseModel).filter(database.ExpenseModel.settlement_id == settlement_id).all()
+
+# ===== PLATFORM FEE / LATE COMMISSION API =====
+@app.get("/api/members/{member_id}/platform-fee")
+def get_member_platform_fee(member_id: int, db = Depends(database.get_db)):
+    """
+    Calculate platform fee (₹5/day) for members with outstanding dues.
+    Fee starts from Day 1 — no grace period.
+    The clock starts from the oldest unpaid due order in the current due cycle.
+    """
+    from datetime import datetime, timezone
+
+    FEE_PER_DAY = 5.0
+
+    if database.USE_SUPABASE:
+        # Get member
+        mem_res = db.table("members").select("*").eq("id", member_id).execute()
+        if not mem_res.data:
+            raise HTTPException(status_code=404, detail="Member not found")
+        member = mem_res.data[0]
+        base_due = float(member.get("due_bill") or 0)
+
+        if base_due <= 0:
+            return {"days": 0, "fee_per_day": FEE_PER_DAY, "platform_fee": 0.0,
+                    "base_due": 0.0, "total_payable": 0.0, "oldest_due_date": None}
+
+        # Find last payment date for this member
+        pmt_res = db.table("member_payments").select("created_at").eq("member_id", member_id).order("created_at", desc=True).limit(1).execute()
+        last_payment_date_str = pmt_res.data[0]["created_at"] if pmt_res.data else None
+
+        # Find oldest due order since last payment (or ever if no payment)
+        orders_q = db.table("orders").select("completed_at, created_at").eq("member_id", member_id).eq("payment_status", "due").eq("status", "done")
+        if last_payment_date_str:
+            orders_q = orders_q.gte("completed_at", last_payment_date_str)
+        orders_res = orders_q.order("completed_at", desc=False).limit(1).execute()
+
+        oldest_date_str = None
+        if orders_res.data:
+            oldest_date_str = orders_res.data[0].get("completed_at") or orders_res.data[0].get("created_at")
+
+        if not oldest_date_str:
+            return {"days": 0, "fee_per_day": FEE_PER_DAY, "platform_fee": 0.0,
+                    "base_due": base_due, "total_payable": base_due, "oldest_due_date": None}
+
+        try:
+            oldest_date = datetime.fromisoformat(oldest_date_str.replace('Z', '+00:00')).date()
+        except Exception:
+            return {"days": 0, "fee_per_day": FEE_PER_DAY, "platform_fee": 0.0,
+                    "base_due": base_due, "total_payable": base_due, "oldest_due_date": oldest_date_str}
+
+        today = datetime.now(timezone.utc).date()
+        days_overdue = max(0, (today - oldest_date).days)
+        platform_fee = round(days_overdue * FEE_PER_DAY, 2)
+
+        return {
+            "days": days_overdue,
+            "fee_per_day": FEE_PER_DAY,
+            "platform_fee": platform_fee,
+            "base_due": base_due,
+            "total_payable": round(base_due + platform_fee, 2),
+            "oldest_due_date": oldest_date_str
+        }
+
+    else:
+        # SQLite
+        db_member = db.query(database.MemberModel).filter(database.MemberModel.id == member_id).first()
+        if not db_member:
+            raise HTTPException(status_code=404, detail="Member not found")
+
+        base_due = float(db_member.due_bill or 0)
+
+        if base_due <= 0:
+            return {"days": 0, "fee_per_day": FEE_PER_DAY, "platform_fee": 0.0,
+                    "base_due": 0.0, "total_payable": 0.0, "oldest_due_date": None}
+
+        # Find last payment
+        last_pmt = db.query(database.MemberPaymentModel).filter(
+            database.MemberPaymentModel.member_id == member_id
+        ).order_by(database.MemberPaymentModel.created_at.desc()).first()
+
+        # Find oldest due order since last payment
+        orders_q = db.query(database.OrderModel).filter(
+            database.OrderModel.member_id == member_id,
+            database.OrderModel.payment_status == "due",
+            database.OrderModel.status == "done"
+        )
+        if last_pmt:
+            orders_q = orders_q.filter(database.OrderModel.completed_at >= last_pmt.created_at)
+
+        oldest_order = orders_q.order_by(database.OrderModel.completed_at.asc()).first()
+
+        if not oldest_order:
+            return {"days": 0, "fee_per_day": FEE_PER_DAY, "platform_fee": 0.0,
+                    "base_due": base_due, "total_payable": base_due, "oldest_due_date": None}
+
+        oldest_date_str = oldest_order.completed_at or oldest_order.created_at
+
+        try:
+            oldest_date = datetime.fromisoformat(oldest_date_str.replace('Z', '+00:00')).date()
+        except Exception:
+            return {"days": 0, "fee_per_day": FEE_PER_DAY, "platform_fee": 0.0,
+                    "base_due": base_due, "total_payable": base_due, "oldest_due_date": oldest_date_str}
+
+        today = datetime.now(timezone.utc).date()
+        days_overdue = max(0, (today - oldest_date).days)
+        platform_fee = round(days_overdue * FEE_PER_DAY, 2)
+
+        return {
+            "days": days_overdue,
+            "fee_per_day": FEE_PER_DAY,
+            "platform_fee": platform_fee,
+            "base_due": base_due,
+            "total_payable": round(base_due + platform_fee, 2),
+            "oldest_due_date": oldest_date_str
+        }
 
 @app.post("/api/superadmin/reset")
 def reset_all_data(db = Depends(database.get_db)):

@@ -26,6 +26,8 @@ CREATE TABLE IF NOT EXISTS orders (
     total_price FLOAT NOT NULL,
     status TEXT DEFAULT 'pending',
     payment_mode TEXT,
+    payment_status TEXT DEFAULT 'paid',
+    member_id INTEGER,
     discount FLOAT DEFAULT 0,
     final_amount FLOAT,
     settled INTEGER DEFAULT 0,
@@ -64,11 +66,32 @@ CREATE TABLE IF NOT EXISTS monthly_settlements (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
--- Add Foreign Key relationships for settlements
+-- 7. Members Table
+CREATE TABLE IF NOT EXISTS members (
+    id SERIAL PRIMARY KEY,
+    name TEXT NOT NULL,
+    phone TEXT,
+    total_bill FLOAT DEFAULT 0.0,
+    due_bill FLOAT DEFAULT 0.0,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 8. Member Payments Table
+CREATE TABLE IF NOT EXISTS member_payments (
+    id SERIAL PRIMARY KEY,
+    member_id INTEGER REFERENCES members(id) ON DELETE CASCADE,
+    amount FLOAT NOT NULL,
+    payment_mode TEXT NOT NULL,
+    note TEXT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Add Foreign Key relationships for settlements & members
 ALTER TABLE orders ADD CONSTRAINT fk_order_settlement FOREIGN KEY (settlement_id) REFERENCES monthly_settlements(id);
 ALTER TABLE expenses ADD CONSTRAINT fk_expense_settlement FOREIGN KEY (settlement_id) REFERENCES monthly_settlements(id);
+ALTER TABLE orders ADD CONSTRAINT fk_order_member FOREIGN KEY (member_id) REFERENCES members(id);
 
--- 7. Cafe Wallet Table
+-- 9. Cafe Wallet Table
 CREATE TABLE IF NOT EXISTS cafe_wallet (
     id INTEGER PRIMARY KEY DEFAULT 1,
     balance FLOAT DEFAULT 0.0
@@ -77,7 +100,7 @@ CREATE TABLE IF NOT EXISTS cafe_wallet (
 -- Initialize wallet if empty
 INSERT INTO cafe_wallet (id, balance) VALUES (1, 0.0) ON CONFLICT (id) DO NOTHING;
 
--- 8. Wallet Transactions Table
+-- 10. Wallet Transactions Table
 CREATE TABLE IF NOT EXISTS wallet_transactions (
     id SERIAL PRIMARY KEY,
     amount FLOAT NOT NULL,
@@ -85,7 +108,7 @@ CREATE TABLE IF NOT EXISTS wallet_transactions (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
--- 9. System Settings Table
+-- 11. System Settings Table
 CREATE TABLE IF NOT EXISTS system_settings (
     key TEXT PRIMARY KEY,
     value FLOAT NOT NULL
@@ -95,13 +118,14 @@ CREATE TABLE IF NOT EXISTS system_settings (
 INSERT INTO system_settings (key, value) VALUES ('commission_rate', 2.0) ON CONFLICT (key) DO NOTHING;
 
 -- IMPORTANT: DISABLE RLS (Row Level Security) TO ALLOW FRONTEND/BACKEND ACCESS WITHOUT AUTH
--- Alternatively, you can create specific policies if you prefer security.
 ALTER TABLE categories DISABLE ROW LEVEL SECURITY;
 ALTER TABLE items DISABLE ROW LEVEL SECURITY;
 ALTER TABLE orders DISABLE ROW LEVEL SECURITY;
 ALTER TABLE order_items DISABLE ROW LEVEL SECURITY;
 ALTER TABLE expenses DISABLE ROW LEVEL SECURITY;
 ALTER TABLE monthly_settlements DISABLE ROW LEVEL SECURITY;
+ALTER TABLE members DISABLE ROW LEVEL SECURITY;
+ALTER TABLE member_payments DISABLE ROW LEVEL SECURITY;
 ALTER TABLE cafe_wallet DISABLE ROW LEVEL SECURITY;
 ALTER TABLE wallet_transactions DISABLE ROW LEVEL SECURITY;
 ALTER TABLE system_settings DISABLE ROW LEVEL SECURITY;
