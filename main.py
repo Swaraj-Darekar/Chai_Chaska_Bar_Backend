@@ -1555,22 +1555,34 @@ def get_member_platform_fee(member_id: int, db = Depends(database.get_db)):
 @app.post("/api/superadmin/reset")
 def reset_all_data(db = Depends(database.get_db)):
     if database.USE_SUPABASE:
-        db.table("order_items").delete().neq("id", -1).execute()
-        db.table("orders").delete().neq("id", -1).execute()
-        db.table("expenses").delete().neq("id", -1).execute()
-        db.table("monthly_settlements").delete().neq("id", -1).execute()
-        db.table("wallet_transactions").delete().neq("id", -1).execute()
-        db.table("cafe_wallet").update({"balance": 0.0}).eq("id", 1).execute()
+        try:
+            db.table("order_items").delete().neq("id", -1).execute()
+            db.table("member_payments").delete().neq("id", -1).execute()
+            db.table("orders").delete().neq("id", -1).execute()
+            db.table("expenses").delete().neq("id", -1).execute()
+            db.table("monthly_settlements").delete().neq("id", -1).execute()
+            db.table("members").delete().neq("id", -1).execute()
+            db.table("wallet_transactions").delete().neq("id", -1).execute()
+            db.table("items").delete().neq("id", -1).execute()
+            db.table("categories").delete().neq("id", -1).execute()
+            db.table("cafe_wallet").update({"balance": 0.0}).eq("id", 1).execute()
+        except Exception as e:
+            print(f"Error resetting database: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
     else:
         db.query(database.OrderItemModel).delete()
+        db.query(database.MemberPaymentModel).delete()
         db.query(database.OrderModel).delete()
         db.query(database.ExpenseModel).delete()
         db.query(database.MonthlySettlementModel).delete()
+        db.query(database.MemberModel).delete()
         db.query(database.WalletTransactionModel).delete()
+        db.query(database.ItemModel).delete()
+        db.query(database.CategoryModel).delete()
         wallet = db.query(database.CafeWalletModel).filter(database.CafeWalletModel.id == 1).first()
         if wallet:
             wallet.balance = 0.0
         else:
             db.add(database.CafeWalletModel(id=1, balance=0.0))
         db.commit()
-    return {"message": "System reset successfully"}
+    return {"message": "System reset successfully - all tables cleared!"}
