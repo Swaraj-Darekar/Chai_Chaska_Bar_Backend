@@ -761,15 +761,43 @@ def update_member(member_id: int, data: MemberUpdate, db = Depends(database.get_
 @app.delete("/api/members/{member_id}")
 def delete_member(member_id: int, db = Depends(database.get_db)):
     if database.USE_SUPABASE:
-        # Delete member payments
-        db.table("member_payments").delete().eq("member_id", member_id).execute()
-        # Delete member
-        res = db.table("members").delete().eq("id", member_id).execute()
-        return {"success": True, "message": "Member deleted successfully"}
+        try:
+            # 1. Fetch member phone if exists
+            mem_res = db.table("members").select("phone").eq("id", member_id).execute()
+            phone = mem_res.data[0].get("phone") if mem_res.data else None
+
+            # 2. Delete all member payments for this member
+            try:
+                db.table("member_payments").delete().eq("member_id", member_id).execute()
+            except Exception as e:
+                print(f"Error deleting member payments: {e}")
+
+            # 3. Unlink member_id from orders
+            try:
+                db.table("orders").update({"member_id": None}).eq("member_id", member_id).execute()
+            except Exception as e:
+                print(f"Error unlinking orders: {e}")
+
+            # 4. If any orders still reference member_id, delete them to prevent FK constraint failure
+            try:
+                db.table("orders").delete().eq("member_id", member_id).execute()
+            except Exception as e:
+                print(f"Error deleting linked orders: {e}")
+
+            # 5. Delete member record
+            res = db.table("members").delete().eq("id", member_id).execute()
+            return {"success": True, "message": "Member deleted successfully"}
+        except Exception as e:
+            print(f"Failed to delete member {member_id}: {e}")
+            raise HTTPException(status_code=400, detail=str(e))
     else:
         db_member = db.query(database.MemberModel).filter(database.MemberModel.id == member_id).first()
         if not db_member:
             raise HTTPException(status_code=404, detail="Member not found")
+        phone = db_member.phone
+        db.query(database.OrderModel).filter(database.OrderModel.member_id == member_id).update({"member_id": None})
+        if phone:
+            db.query(database.OrderModel).filter(database.OrderModel.customer_phone == phone).update({"member_id": None})
         db.query(database.MemberPaymentModel).filter(database.MemberPaymentModel.member_id == member_id).delete()
         db.delete(db_member)
         db.commit()
